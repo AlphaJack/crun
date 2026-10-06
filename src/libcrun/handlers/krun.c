@@ -39,15 +39,10 @@
 
 #ifdef HAVE_LIBKRUN
 #  include <libkrun.h>
+#  include <libkrun_init.h>
+#  include <libkrun_display.h>
 #endif
 
-/* This allows us to build even with headers from older libkrun versions.
- * If the installed version of libkrun doesn't support this feature,
- * krun_add_net_unixstream() will return EINVAL.
- */
-#ifndef NET_FLAG_DHCP_CLIENT
-#  define NET_FLAG_DHCP_CLIENT (1 << 1)
-#endif
 /* libkrun has a hard-limit of 16 vCPUs per microVM. */
 #define LIBKRUN_MAX_VCPUS 16
 
@@ -57,15 +52,20 @@
 /* The minimum amount of RAM for a viable microVM is 128 MB. */
 #define LIBKRUN_MINIMUM_RAM_MIB 128
 
-/* crun dumps the container configuration into this file, which will be read by
- * libkrun to set up the environment for the workload inside the microVM.
- */
-#define KRUN_CONFIG_FILE ".krun_config.json"
+/* Default to a conservative DAX size of 512MB, just like libkrun 1.x krun_set_root() did. */
+#define LIBKRUN_DEFAULT_VIRTIOFS_SHM_SIZE (512 * 1024 * 1024ULL)
+
+/* virtio-net feature bits negotiated with the guest (same set as libkrun's examples). */
+#define LIBKRUN_COMPAT_NET_FEATURES ((1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14))
+
+#define LIBKRUN_GUEST_CID 3
 
 /* The presence of this file indicates this is a container intended to be run
  * as a confidential workload inside a SEV-powered TEE.
  */
 #define KRUN_SEV_FILE "/krun-sev.json"
+
+#define KRUN_SEV_ROOT_DISK "/disk.img"
 
 /* This file contains configuration parameters for the microVM. crun needs to
  * read and parse it, using the information obtained from it to configure
@@ -84,11 +84,9 @@ struct krun_config
   void *handle;
   void *handle_sev;
   void *handle_awsnitro;
+  void *handle_init;
   bool sev;
   bool awsnitro;
-  int32_t ctx_id;
-  int32_t ctx_id_sev;
-  int32_t ctx_id_awsnitro;
   bool has_kvm;
   bool has_awsnitro;
   int passt_fds[2];
@@ -96,73 +94,98 @@ struct krun_config
   json_object *config_tree;
   bool use_passt;
   const char *tap_name;
-  int gpu_render_server_fd;
   int gpu_flags;
+  char *oci_config_json;
+  size_t oci_config_json_size;
+  KrunPayload payload;
 };
 
 /* libkrun handler.  */
 #if HAVE_DLOPEN && HAVE_LIBKRUN
-static int32_t
-libkrun_create_context (void *handle, libcrun_error_t *err)
+
+static void *
+libkrun_dlsym (void *handle, const char *name, libcrun_error_t *err)
 {
-  int32_t (*krun_create_ctx) ();
-  int32_t ctx_id;
-
-  krun_create_ctx = dlsym (handle, "krun_create_ctx");
-  if (krun_create_ctx == NULL)
-    return crun_make_error (err, 0, "could not find symbol in the krun library");
-
-  ctx_id = krun_create_ctx ();
-  if (UNLIKELY (ctx_id < 0))
-    return crun_make_error (err, -ctx_id, "could not create krun context");
-
-  return ctx_id;
+  void *sym = dlsym (handle, name);
+  if (sym == NULL)
+    {
+      crun_make_error (err, 0, "could not find symbol `%s` in the krun library", name);
+      return NULL;
+    }
+  return sym;
 }
 
-static int
-libkrun_configure_kernel (uint32_t ctx_id, void *handle, json_object *config_tree, libcrun_error_t *err)
+/* For the container process, where there is nobody left to report errors to.  */
+static void *
+libkrun_dlsym_or_die (void *handle, const char *name)
 {
-  int32_t (*krun_set_kernel) (uint32_t ctx_id, const char *kernel_path,
-                              uint32_t kernel_format, const char *initrd_path, const char *kernel_cmdline);
-  json_object *kernel_path = NULL;
-  json_object *kernel_format = NULL;
-  json_object *val_initrd_path = NULL;
-  json_object *val_kernel_cmdline = NULL;
-  const char *initrd_path = NULL;
-  const char *kernel_cmdline = NULL;
-  int ret;
+  void *sym = dlsym (handle, name);
+  if (sym == NULL)
+    error (EXIT_FAILURE, 0, "could not find symbol `%s` in the krun library", name);
+  return sym;
+}
 
-  /* kernel_path and kernel_format must be present */
-  kernel_path = json_object_object_get (config_tree, "kernel_path");
-  if (kernel_path == NULL || ! json_object_is_type (kernel_path, json_type_string))
-    return 0;
+#  define KRUN_SYM(handle, name) ((name##_fn) libkrun_dlsym_or_die (handle, #name))
 
-  kernel_format = json_object_object_get (config_tree, "kernel_format");
-  if (kernel_format == NULL || ! json_object_is_type (kernel_format, json_type_int))
-    return 0;
+static bool
+libkrun_errmsg_push (void *userdata, KrunStr s)
+{
+  char **buf = userdata;
+  size_t cur = *buf ? strlen (*buf) : 0;
+  char *tmp;
 
-  /* initrd and kernel_cmdline are optional */
-  val_initrd_path = json_object_object_get (config_tree, "initrd_path");
-  if (val_initrd_path != NULL && json_object_is_type (val_initrd_path, json_type_string))
-    initrd_path = json_object_get_string (val_initrd_path);
+  tmp = realloc (*buf, cur + s.len + 1);
+  if (tmp == NULL)
+    return false;
+  memcpy (tmp + cur, s.data, s.len);
+  tmp[cur + s.len] = '\0';
+  *buf = tmp;
+  return true;
+}
 
-  val_kernel_cmdline = json_object_object_get (config_tree, "kernel_cmdline");
-  if (val_kernel_cmdline != NULL && json_object_is_type (val_kernel_cmdline, json_type_string))
-    kernel_cmdline = json_object_get_string (val_kernel_cmdline);
+/* Return a malloc'ed description of KRUN_ERR and destroy it.  */
+static char *
+libkrun_error_string (void *handle, KrunError krun_err)
+{
+  krun_error_message_fn message = dlsym (handle, "krun_error_message");
+  krun_error_destroy_fn destroy = dlsym (handle, "krun_error_destroy");
+  KrunPushStrVtable vtable = { .drop = NULL, .push = libkrun_errmsg_push };
+  char *msg = NULL;
+  KrunVtableHandle writer = KRUN_VTABLE_HANDLE (KRUN_PUSH_STR_TYPE_TAG, vtable, &msg);
 
-  krun_set_kernel = dlsym (handle, "krun_set_kernel");
-  if (krun_set_kernel == NULL)
-    return crun_make_error (err, 0, "could not find symbol in krun library");
+  if (krun_err == NULL)
+    return xstrdup ("unknown error");
+  if (message)
+    message (krun_err, &writer);
+  if (destroy)
+    destroy (krun_err);
+  return msg ? msg : xstrdup ("unknown error");
+}
 
-  ret = krun_set_kernel (ctx_id,
-                         json_object_get_string (kernel_path),
-                         (uint32_t) json_object_get_int64 (kernel_format),
-                         initrd_path, kernel_cmdline);
+static char *
+libkrun_init_error_string (void *handle_init, KrunInitError init_err)
+{
+  krun_init_error_message_fn message = dlsym (handle_init, "krun_init_error_message");
+  krun_init_error_destroy_fn destroy = dlsym (handle_init, "krun_init_error_destroy");
+  KrunInitPushStrVtable vtable = { .drop = NULL, .push = libkrun_errmsg_push };
+  char *msg = NULL;
+  KrunVtableHandle writer = KRUN_VTABLE_HANDLE (KRUN_INIT_PUSH_STR_TYPE_TAG, vtable, &msg);
 
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, -ret, "could not configure a krun external kernel");
+  if (init_err == NULL)
+    return xstrdup ("unknown error");
+  if (message)
+    message (init_err, &writer);
+  if (destroy)
+    destroy (init_err);
+  return msg ? msg : xstrdup ("unknown error");
+}
 
-  return 0;
+static void
+libkrun_die_on_error (void *handle, KrunError krun_err, const char *what)
+{
+  if (krun_err == NULL)
+    return;
+  error (EXIT_FAILURE, 0, "%s: %s", what, libkrun_error_string (handle, krun_err));
 }
 
 static int
@@ -271,6 +294,40 @@ libkrun_parse_string_configuration (json_object *config_tree, libcrun_container_
   return 0;
 }
 
+static const char *
+libkrun_config_string (json_object *config_tree, const char *key)
+{
+  json_object *val;
+
+  if (config_tree == NULL)
+    return NULL;
+
+  val = json_object_object_get (config_tree, key);
+  if (val == NULL || ! json_object_is_type (val, json_type_string))
+    return NULL;
+
+  return json_object_get_string (val);
+}
+
+static bool
+libkrun_uses_external_kernel (struct krun_config *kconf, libcrun_container_t *container)
+{
+  json_object *kernel_format;
+
+  if (kconf->config_tree == NULL)
+    return false;
+
+  if (libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.custom_kernel", "custom_kernel", false) <= 0)
+    return false;
+
+  /* kernel_path and kernel_format must be present, otherwise fall back to libkrunfw.  */
+  if (libkrun_config_string (kconf->config_tree, "kernel_path") == NULL)
+    return false;
+
+  kernel_format = json_object_object_get (kconf->config_tree, "kernel_format");
+  return kernel_format != NULL && json_object_is_type (kernel_format, json_type_int);
+}
+
 static void
 libkrun_make_tap_mac (const char *id, uint8_t mac[6])
 {
@@ -290,15 +347,419 @@ libkrun_make_tap_mac (const char *id, uint8_t mac[6])
 }
 
 static int
-libkrun_configure_vm (uint32_t ctx_id, void *handle, struct krun_config *kconf, libcrun_container_t *container, libcrun_error_t *err)
+libkrun_configure_flavor (struct krun_config *kconf, libcrun_container_t *container, libcrun_error_t *err)
+{
+  const char *flavor = find_annotation (container, "krun.variant");
+  bool sev_indicated = flavor != NULL && strcmp (flavor, KRUN_FLAVOR_SEV) == 0;
+  bool awsnitro_indicated = flavor != NULL && strcmp (flavor, KRUN_FLAVOR_AWS_NITRO) == 0;
+  void *close_handles[2] = { NULL, NULL };
+  int i, ret;
+
+  if (sev_indicated)
+    {
+      if (kconf->handle_sev == NULL)
+        return crun_make_error (err, 0, "the container requires libkrun-sev but it's not available");
+
+      close_handles[0] = kconf->handle;
+      close_handles[1] = kconf->handle_awsnitro;
+      kconf->handle = kconf->handle_sev;
+      kconf->sev = true;
+    }
+  else if (awsnitro_indicated)
+    {
+      if (kconf->handle_awsnitro == NULL)
+        return crun_make_error (err, 0, "the container requires libkrun-awsnitro but it's not available");
+
+      close_handles[0] = kconf->handle;
+      close_handles[1] = kconf->handle_sev;
+      kconf->handle = kconf->handle_awsnitro;
+      kconf->awsnitro = true;
+    }
+  else
+    {
+      if (kconf->handle == NULL)
+        return crun_make_error (err, 0, "the container requires libkrun but it's not available");
+
+      close_handles[0] = kconf->handle_sev;
+      close_handles[1] = kconf->handle_awsnitro;
+    }
+
+  /* The selected flavor now lives in kconf->handle; the other handles are no longer needed.  */
+  kconf->handle_sev = NULL;
+  kconf->handle_awsnitro = NULL;
+
+  for (i = 0; i < 2; i++)
+    {
+      if (close_handles[i] == NULL)
+        continue;
+
+      ret = dlclose (close_handles[i]);
+      if (UNLIKELY (ret != 0))
+        return crun_make_error (err, 0, "could not unload handle: `%s`", dlerror ());
+    }
+
+  return 0;
+}
+
+/* Load the kernel payload while the host file system is still visible.  libkrunfw is
+   a shared library that is dlopen'ed by libkrun, so it must be loaded before the
+   container enters its mount namespace.  External kernels live in the rootfs and are
+   loaded from inside the container instead, so that symlinks cannot escape it.  */
+static int
+libkrun_load_payload (struct krun_config *kconf, int rootfsfd, const char *rootfs, libcrun_container_t *container, libcrun_error_t *err)
+{
+  KrunError krun_err = NULL;
+
+  if (kconf->awsnitro || libkrun_uses_external_kernel (kconf, container))
+    return 0;
+
+  if (kconf->sev)
+    {
+      krun_payload_load_krunfw_tee_fn load_krunfw_tee;
+      cleanup_free char *fd_path = NULL;
+      cleanup_close int fd = -1;
+
+      load_krunfw_tee = libkrun_dlsym (kconf->handle, "krun_payload_load_krunfw_tee", err);
+      if (load_krunfw_tee == NULL)
+        return -1;
+
+      /* CVE-2025-24965: the content below rootfs cannot be trusted because it is controlled by the user.  We
+         must ensure the file is opened below the rootfs directory.  */
+      fd = safe_openat (rootfsfd, rootfs, KRUN_SEV_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0, err);
+      if (UNLIKELY (fd < 0))
+        return fd;
+
+      xasprintf (&fd_path, "/proc/self/fd/%d", fd);
+      kconf->payload = load_krunfw_tee (KRUN_STR (fd_path), KRUN_STR (NULL), &krun_err);
+    }
+  else
+    {
+      krun_payload_load_krunfw_fn load_krunfw;
+
+      load_krunfw = libkrun_dlsym (kconf->handle, "krun_payload_load_krunfw", err);
+      if (load_krunfw == NULL)
+        return -1;
+
+      kconf->payload = load_krunfw (&krun_err);
+    }
+
+  if (krun_err != NULL || kconf->payload == NULL)
+    {
+      cleanup_free char *msg = libkrun_error_string (kconf->handle, krun_err);
+      kconf->payload = NULL;
+      return crun_make_error (err, 0, "could not load the krun kernel payload: %s", msg);
+    }
+
+  return 0;
+}
+
+static void
+libkrun_setup_logging (void *handle)
+{
+  krun_init_log_fn init_log = KRUN_SYM (handle, krun_init_log);
+  KrunError krun_err = NULL;
+  uint32_t level;
+
+  /* Set log level according to crun's verbosity. */
+  switch (libcrun_get_verbosity ())
+    {
+    case LIBCRUN_VERBOSITY_DEBUG:
+      level = KRUN_LOG_LEVEL_DEBUG;
+      break;
+    case LIBCRUN_VERBOSITY_WARNING:
+      level = KRUN_LOG_LEVEL_WARN;
+      break;
+    default:
+      level = KRUN_LOG_LEVEL_ERROR;
+      break;
+    }
+
+  init_log (-1, level, KRUN_LOG_STYLE_NEVER, 0, &krun_err);
+  if (krun_err != NULL)
+    {
+      cleanup_free char *msg = libkrun_error_string (handle, krun_err);
+      libcrun_warning ("could not initialize krun logging: %s", msg);
+    }
+}
+
+static KrunPayload
+libkrun_external_kernel_payload (struct krun_config *kconf)
+{
+  krun_payload_load_external_fn load_external = KRUN_SYM (kconf->handle, krun_payload_load_external);
+  const char *kernel_path = libkrun_config_string (kconf->config_tree, "kernel_path");
+  const char *initrd_path = libkrun_config_string (kconf->config_tree, "initrd_path");
+  const char *kernel_cmdline = libkrun_config_string (kconf->config_tree, "kernel_cmdline");
+  uint32_t kernel_format = (uint32_t) json_object_get_int64 (json_object_object_get (kconf->config_tree, "kernel_format"));
+  KrunError krun_err = NULL;
+  KrunPayload payload;
+
+  payload = load_external (KRUN_STR (kernel_path), kernel_format, KRUN_STR (initrd_path), KRUN_STR (kernel_cmdline), &krun_err);
+  libkrun_die_on_error (kconf->handle, krun_err, "could not configure a krun external kernel");
+  if (payload == NULL)
+    error (EXIT_FAILURE, 0, "could not configure a krun external kernel");
+  return payload;
+}
+
+static char *
+libkrun_join_strings (char *const strings[], size_t count, char sep)
+{
+  size_t len = 1, i;
+  char *out, *p;
+
+  for (i = 0; i < count; i++)
+    len += strlen (strings[i]) + 1;
+
+  out = p = xmalloc (len);
+  for (i = 0; i < count; i++)
+    {
+      size_t n = strlen (strings[i]);
+
+      if (i > 0)
+        *p++ = sep;
+      memcpy (p, strings[i], n);
+      p += n;
+    }
+  *p = '\0';
+  return out;
+}
+
+static KrunPayload
+libkrun_nitro_payload (struct krun_config *kconf, libcrun_container_t *container, const char *pathname, char *const argv[])
 {
   runtime_spec_schema_config_schema *def = container->container_def;
-  int32_t (*krun_set_vm_config) (uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib);
-  int32_t (*krun_add_net_unixstream) (uint32_t ctx_id, const char *c_path, int fd, uint8_t *const c_mac, uint32_t features, uint32_t flags);
-  int32_t (*krun_add_net_tap) (uint32_t ctx_id, const char *c_tap_name, const uint8_t *c_mac, uint32_t features, uint32_t flags);
-  int32_t (*krun_set_gpu_options) (uint32_t ctx_id, uint32_t virgl_flags);
-  int32_t (*krun_set_gpu_render_server_fd) (uint32_t ctx_id, int fd);
-  int cpus, ram_mib, nested_virt, ret;
+  void *handle = kconf->handle;
+  KrunNitroConfig nitro = KRUN_SYM (handle, krun_nitro_config_new) ();
+  size_t argc = 0, env_len = def->process ? def->process->env_len : 0;
+  cleanup_free char *args = NULL;
+  cleanup_free char *env = NULL;
+  KrunError krun_err = NULL;
+  KrunPayload payload;
+
+  while (argv[argc])
+    argc++;
+  args = libkrun_join_strings (&argv[1], argc > 0 ? argc - 1 : 0, ' ');
+  env = libkrun_join_strings (def->process ? def->process->env : NULL, env_len, ' ');
+
+  KRUN_SYM (handle, krun_nitro_config_rootfs) (&nitro, KRUN_STR ("/"));
+  KRUN_SYM (handle, krun_nitro_config_exec_path) (&nitro, KRUN_STR (pathname));
+  KRUN_SYM (handle, krun_nitro_config_args) (&nitro, KRUN_STR (args));
+  KRUN_SYM (handle, krun_nitro_config_env) (&nitro, KRUN_STR (env));
+  if (def->process && def->process->cwd)
+    KRUN_SYM (handle, krun_nitro_config_workdir) (&nitro, KRUN_STR (def->process->cwd));
+  // Redirect all enclave output (read from vsock) to stdout.
+  KRUN_SYM (handle, krun_nitro_config_console_output) (&nitro, KRUN_STR ("/dev/stdout"));
+  if (kconf->use_passt)
+    KRUN_SYM (handle, krun_nitro_config_net_fd) (&nitro, kconf->passt_fds[FD_PAIR_PARENT]);
+
+  payload = KRUN_SYM (handle, krun_payload_nitro_enclave) (nitro, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not configure the enclave");
+  if (payload == NULL)
+    error (EXIT_FAILURE, 0, "could not configure the enclave");
+  return payload;
+}
+
+/* Inject the init binary and its configuration into the guest root.  Returns the
+   overlay that must be attached to the root virtiofs device.  */
+static KrunFsOverlay
+libkrun_apply_init_config (struct krun_config *kconf, KrunPayload payload, KrunInitBuilder *builder)
+{
+  void *handle_init = kconf->handle_init;
+  krun_init_builder_build_fn build = KRUN_SYM (handle_init, krun_init_builder_build);
+  krun_init_config_apply_in_fn apply_in = KRUN_SYM (handle_init, krun_init_config_apply_in);
+  KrunFsOverlay overlay = KRUN_SYM (kconf->handle, krun_fs_overlay_new) ();
+  KrunInitError init_err = NULL;
+  KrunInitConfig config;
+
+  config = build (builder);
+  apply_in (config, kconf->handle, overlay, payload, &init_err);
+  if (init_err != NULL)
+    error (EXIT_FAILURE, 0, "could not apply the krun init configuration: %s", libkrun_init_error_string (handle_init, init_err));
+
+  return overlay;
+}
+
+static KrunInitBuilder
+libkrun_init_builder (struct krun_config *kconf)
+{
+  void *handle_init = kconf->handle_init;
+  krun_init_builder_from_oci_json_fn from_oci_json = KRUN_SYM (handle_init, krun_init_builder_from_oci_json);
+  KrunStr oci_json = { kconf->oci_config_json, kconf->oci_config_json_size };
+  KrunInitError init_err = NULL;
+  KrunInitBuilder builder;
+
+  builder = from_oci_json (oci_json, &init_err);
+  if (init_err != NULL)
+    error (EXIT_FAILURE, 0, "could not parse the OCI configuration for the krun init: %s", libkrun_init_error_string (handle_init, init_err));
+
+  if (kconf->use_passt)
+    KRUN_SYM (handle_init, krun_init_builder_dhcp) (&builder, true);
+
+  return builder;
+}
+
+static void
+libkrun_add_console (void *handle, KrunMmioDeviceManager devices)
+{
+  KrunConsoleBuilder console_builder = KRUN_SYM (handle, krun_console_device_builder) ();
+  KrunError krun_err = NULL;
+  KrunConsoleDevice console;
+
+  KRUN_SYM (handle, krun_console_builder_add_default_console) (console_builder, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not configure the virtio console");
+
+  console = KRUN_SYM (handle, krun_console_builder_build) (console_builder, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not create the virtio console");
+
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, console);
+}
+
+static void
+libkrun_add_root_fs (struct krun_config *kconf, KrunMmioDeviceManager devices, KrunFsOverlay overlay)
+{
+  void *handle = kconf->handle;
+  const char *virtiofs_tag = libkrun_config_string (kconf->config_tree, "virtiofs_tag");
+  uint64_t virtiofs_shm_size = LIBKRUN_DEFAULT_VIRTIOFS_SHM_SIZE;
+  json_object *val_virtiofs_shm_size = NULL;
+  KrunError krun_err = NULL;
+  KrunFsDevice rootfs;
+
+  if (virtiofs_tag == NULL)
+    virtiofs_tag = "/dev/root";
+
+  if (kconf->config_tree != NULL)
+    {
+      val_virtiofs_shm_size = json_object_object_get (kconf->config_tree, "virtiofs_shm_size");
+      if (val_virtiofs_shm_size != NULL && json_object_is_type (val_virtiofs_shm_size, json_type_int))
+        virtiofs_shm_size = json_object_get_uint64 (val_virtiofs_shm_size);
+    }
+
+  rootfs = KRUN_SYM (handle, krun_fs_device_new) (KRUN_STR (virtiofs_tag), KRUN_STR ("/"), &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not add virtiofs root");
+
+  KRUN_SYM (handle, krun_fs_device_set_overlay) (rootfs, overlay);
+  if (virtiofs_shm_size > 0)
+    KRUN_SYM (handle, krun_fs_device_set_dax_window_size) (rootfs, virtiofs_shm_size);
+
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, rootfs);
+}
+
+static void
+libkrun_add_root_disk (void *handle, KrunMmioDeviceManager devices)
+{
+  KrunError krun_err = NULL;
+  KrunBlockDevice disk;
+
+  disk = KRUN_SYM (handle, krun_block_device_new) (KRUN_STR ("root"), KRUN_STR (KRUN_SEV_ROOT_DISK), KRUN_DISK_FORMAT_RAW, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not set root disk");
+
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, disk);
+}
+
+static void
+libkrun_add_vsock (struct krun_config *kconf, KrunMmioDeviceManager devices)
+{
+  void *handle = kconf->handle;
+  uint32_t tsi_flags = (kconf->tap_name != NULL || kconf->use_passt) ? 0 : KRUN_TSI_FLAGS_HIJACK_INET;
+  KrunError krun_err = NULL;
+  KrunVsockDevice vsock;
+
+  vsock = KRUN_SYM (handle, krun_vsock_device_new) (LIBKRUN_GUEST_CID, tsi_flags, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not create the vsock device");
+
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, vsock);
+}
+
+static void
+libkrun_add_net (struct krun_config *kconf, libcrun_container_t *container, KrunMmioDeviceManager devices)
+{
+  void *handle = kconf->handle;
+  KrunError krun_err = NULL;
+  KrunNetDevice net;
+  uint8_t mac[6];
+  KrunBytes mac_bytes = { mac, sizeof (mac) };
+
+  if (kconf->tap_name != NULL)
+    {
+      krun_net_device_new_tap_fn new_tap = dlsym (handle, "krun_net_device_new_tap");
+      if (new_tap == NULL)
+        error (EXIT_FAILURE, 0, "krun.tap_name requested but the version of libkrun in this system does not support virtio-net");
+
+      libkrun_make_tap_mac (container->context->id, mac);
+      net = new_tap (KRUN_STR ("net0"), KRUN_STR (kconf->tap_name), mac_bytes, LIBKRUN_COMPAT_NET_FEATURES, &krun_err);
+      libkrun_die_on_error (handle, krun_err, "could not add krun TAP interface");
+    }
+  else if (kconf->use_passt)
+    {
+      static const uint8_t passt_mac[] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee };
+      krun_net_device_new_unixstream_fd_fn new_unixstream_fd = dlsym (handle, "krun_net_device_new_unixstream_fd");
+      if (new_unixstream_fd == NULL)
+        error (EXIT_FAILURE, 0, "krun.use_passt requested but the version of libkrun in this system does not support virtio-net");
+
+      memcpy (mac, passt_mac, sizeof (mac));
+      net = new_unixstream_fd (KRUN_STR ("net0"), kconf->passt_fds[FD_PAIR_PARENT], mac_bytes, LIBKRUN_COMPAT_NET_FEATURES, 0, &krun_err);
+      libkrun_die_on_error (handle, krun_err, "could not set krun net configuration");
+    }
+  else
+    return;
+
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, net);
+}
+
+static void
+libkrun_add_gpu (struct krun_config *kconf, KrunMmioDeviceManager devices)
+{
+  void *handle = kconf->handle;
+  krun_display_backend_new_fn display_backend_new = dlsym (handle, "krun_display_backend_new");
+  krun_gpu_device_new_fn gpu_device_new = dlsym (handle, "krun_gpu_device_new");
+  /* Headless: the GPU is used for compute (e.g. Venus) and has no scanouts.  */
+  struct krun_display_backend headless = { 0 };
+  KrunError krun_err = NULL;
+  KrunDisplayBackend backend;
+  KrunGpuDevice gpu;
+
+  if (display_backend_new == NULL || gpu_device_new == NULL)
+    error (EXIT_FAILURE, 0, "gpu requested but the version of libkrun in this system does not support it");
+
+  if (kconf->gpu_flags & KRUN_VIRGL_RENDERER_FLAGS_RENDER_SERVER)
+    libcrun_warning ("krun.gpu_flags requests the virgl render server: libkrun 2.0 spawns it itself, the sandboxed launcher used with libkrun 1.x is not available");
+
+  backend = display_backend_new (&headless, sizeof (headless), &krun_err);
+  libkrun_die_on_error (handle, krun_err, "gpu requested but could not create the display backend");
+
+  gpu = gpu_device_new (kconf->gpu_flags, backend);
+  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, gpu);
+}
+
+static void
+libkrun_add_misc_devices (void *handle, KrunMmioDeviceManager devices)
+{
+  krun_rng_device_new_fn rng_new = dlsym (handle, "krun_rng_device_new");
+  krun_balloon_device_new_fn balloon_new = dlsym (handle, "krun_balloon_device_new");
+  krun_mmio_device_manager_add_fn add = KRUN_SYM (handle, krun_mmio_device_manager_add);
+  KrunError krun_err = NULL;
+
+  if (rng_new != NULL)
+    {
+      KrunRngDevice rng = rng_new (&krun_err);
+      libkrun_die_on_error (handle, krun_err, "could not create the virtio-rng device");
+      add (devices, rng);
+    }
+
+  if (balloon_new != NULL)
+    {
+      KrunBalloonDevice balloon = balloon_new (&krun_err);
+      libkrun_die_on_error (handle, krun_err, "could not create the virtio-balloon device");
+      add (devices, balloon);
+    }
+}
+
+static void
+libkrun_configure_vm (struct krun_config *kconf, libcrun_container_t *container, KrunVmmBuilder *builder)
+{
+  runtime_spec_schema_config_schema *def = container->container_def;
+  void *handle = kconf->handle;
+  KrunError krun_err = NULL;
+  int cpus, ram_mib, nested_virt;
   cpu_set_t set;
 
   /* We let the OCI set the number of vCPUs for the VM, since cgroups CPU restrictions still apply. */
@@ -323,400 +784,84 @@ libkrun_configure_vm (uint32_t ctx_id, void *handle, struct krun_config *kconf, 
         ram_mib = LIBKRUN_DEFAULT_RAM_MIB;
     }
 
-  krun_set_vm_config = dlsym (handle, "krun_set_vm_config");
+  KRUN_SYM (handle, krun_vmm_builder_vcpus) (builder, cpus, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not set the number of vCPUs");
 
-  if (krun_set_vm_config == NULL)
-    return crun_make_error (err, 0, "could not find symbol in the krun library");
-
-  ret = krun_set_vm_config (ctx_id, cpus, ram_mib);
-  if (UNLIKELY (ret < 0))
-    return crun_make_error (err, -ret, "could not set krun vm configuration");
+  KRUN_SYM (handle, krun_vmm_builder_ram_mib) (builder, ram_mib, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not set the amount of RAM");
 
   nested_virt = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.nested_virt", "nested_virt", false);
   if (nested_virt > 0)
     {
-      int32_t (*krun_check_nested_virt) (void);
-      int32_t (*krun_set_nested_virt) (uint32_t ctx_id, bool enabled);
+      krun_check_nested_virt_fn check_nested_virt = dlsym (handle, "krun_check_nested_virt");
 
-      krun_check_nested_virt = dlsym (handle, "krun_check_nested_virt");
-      if (krun_check_nested_virt != NULL && krun_check_nested_virt () != 1)
+      if (check_nested_virt != NULL && ! check_nested_virt ())
         libcrun_warning ("nested virtualization requested but may not be supported on this host");
 
-      krun_set_nested_virt = dlsym (handle, "krun_set_nested_virt");
-      if (krun_set_nested_virt == NULL)
-        return crun_make_error (err, 0, "could not find symbol `krun_set_nested_virt` in the krun library");
-
-      ret = krun_set_nested_virt (ctx_id, true);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, -ret, "could not enable nested virtualization");
+      KRUN_SYM (handle, krun_vmm_builder_nested_virt) (builder, true);
     }
-
-  if (kconf->tap_name != NULL)
-    {
-      krun_add_net_tap = dlsym (handle, "krun_add_net_tap");
-      if (krun_add_net_tap == NULL)
-        return crun_make_error (err, 0, "could not find symbol `krun_add_net_tap` in the krun library");
-
-      uint8_t mac[6];
-      libkrun_make_tap_mac (container->context->id, mac);
-      ret = krun_add_net_tap (ctx_id, kconf->tap_name, &mac[0], COMPAT_NET_FEATURES, 0);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, -ret, "could not add krun TAP interface `%s`", kconf->tap_name);
-    }
-  else if (kconf->use_passt)
-    {
-      krun_add_net_unixstream = dlsym (handle, "krun_add_net_unixstream");
-      if (krun_add_net_unixstream == NULL)
-        return crun_make_error (err, 0, "could not find symbol `krun_add_net_unixstream` in the krun library");
-
-      uint8_t mac[] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee };
-      ret = krun_add_net_unixstream (ctx_id, NULL, kconf->passt_fds[FD_PAIR_PARENT], &mac[0], COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT);
-      if (UNLIKELY (ret == -EINVAL))
-        ret = krun_add_net_unixstream (ctx_id, NULL, kconf->passt_fds[FD_PAIR_PARENT], &mac[0], COMPAT_NET_FEATURES, 0);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, -ret, "could not set krun net configuration");
-    }
-
-  if (kconf->gpu_flags > 0)
-    {
-      krun_set_gpu_options = dlsym (kconf->handle, "krun_set_gpu_options");
-      if (krun_set_gpu_options == NULL)
-        return crun_make_error (err, 0, "gpu requested but the version of libkrun in this system does not support it");
-
-      ret = krun_set_gpu_options (kconf->ctx_id, kconf->gpu_flags);
-      if (UNLIKELY (ret < 0))
-        return crun_make_error (err, -ret, "gpu requested but could not configure virtio gpu device");
-
-      if (kconf->gpu_flags & VIRGLRENDERER_RENDER_SERVER)
-        {
-          krun_set_gpu_render_server_fd = dlsym (kconf->handle, "krun_set_gpu_render_server_fd");
-          if (krun_set_gpu_render_server_fd == NULL)
-            return crun_make_error (err, 0, "gpu with render server requested but the version of libkrun in this system does not support it");
-
-          ret = krun_set_gpu_render_server_fd (kconf->ctx_id, kconf->gpu_render_server_fd);
-          if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "gpu with render server requested but could not configure its file descriptor");
-        }
-    }
-
-  if (kconf->config_tree != NULL)
-    {
-      /* Try to configure an external kernel. If the configuration file doesn't
-       * specify a kernel, libkrun automatically fall back to using libkrunfw,
-       * if the library is present and was loaded while creating the context.
-       */
-      int custom_kernel = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.custom_kernel", "custom_kernel", false);
-      if (custom_kernel > 0)
-        {
-          ret = libkrun_configure_kernel (ctx_id, handle, kconf->config_tree, err);
-          if (UNLIKELY (ret))
-            return ret;
-        }
-    }
-
-  return 0;
-}
-
-static int
-libkrun_configure_flavor (void *cookie, libcrun_container_t *container, libcrun_error_t *err)
-{
-  int ret, sev_indicated = 0, awsnitro_indicated = 0;
-  struct krun_config *kconf = (struct krun_config *) cookie;
-  const char *flavor = NULL;
-  void *close_handles[2];
-
-  close_handles[0] = NULL;
-  close_handles[1] = NULL;
-
-  // Check if the user provided the krun variant through OCI annotations.
-  flavor = find_annotation (container, "krun.variant");
-  if (flavor != NULL)
-    {
-      sev_indicated |= strcmp (flavor, KRUN_FLAVOR_SEV) == 0;
-      awsnitro_indicated |= strcmp (flavor, KRUN_FLAVOR_AWS_NITRO) == 0;
-    }
-
-  if (sev_indicated)
-    {
-      if (kconf->handle_sev == NULL)
-        error (EXIT_FAILURE, 0, "the container requires libkrun-sev but it's not available");
-
-      close_handles[0] = kconf->handle;
-      close_handles[1] = kconf->handle_awsnitro;
-
-      kconf->handle = kconf->handle_sev;
-      kconf->ctx_id = kconf->ctx_id_sev;
-      kconf->sev = true;
-    }
-  else if (awsnitro_indicated)
-    {
-      if (kconf->handle_awsnitro == NULL)
-        error (EXIT_FAILURE, 0, "the container requires libkrun-awsnitro but it's not available");
-
-      close_handles[0] = kconf->handle;
-      close_handles[1] = kconf->handle_sev;
-
-      kconf->handle = kconf->handle_awsnitro;
-      kconf->ctx_id = kconf->ctx_id_awsnitro;
-      kconf->awsnitro = true;
-    }
-  else
-    {
-      if (kconf->handle == NULL)
-        error (EXIT_FAILURE, 0, "the container requires libkrun but it's not available");
-
-      close_handles[0] = kconf->handle_sev;
-      close_handles[1] = kconf->handle_awsnitro;
-    }
-
-  // We no longer need the other two libkrun handles.
-  for (int i = 0; i < 2; i++)
-    {
-      if (close_handles[i] == NULL)
-        continue;
-
-      ret = dlclose (close_handles[i]);
-      if (UNLIKELY (ret != 0))
-        return crun_make_error (err, 0, "could not unload handle: `%s`", dlerror ());
-    }
-
-  return 0;
 }
 
 static int
 libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname, char *const argv[])
 {
-  runtime_spec_schema_config_schema *def = container->container_def;
-  int32_t (*krun_set_log_level) (uint32_t level);
-  int (*krun_start_enter) (uint32_t ctx_id);
-  int32_t (*krun_add_virtiofs2) (uint32_t ctx_id, const char *c_tag, const char *c_path, uint64_t shm_size);
-  int32_t (*krun_set_root_disk) (uint32_t ctx_id, const char *disk_path);
-  int32_t (*krun_set_tee_config_file) (uint32_t ctx_id, const char *file_path);
-  int32_t (*krun_set_console_output) (uint32_t ctx_id, const char *c_filepath);
-  int32_t (*krun_set_exec) (uint32_t ctx_id, const char *exec_path,
-                            const char *const argv[], const char *const envp[]);
   struct krun_config *kconf = (struct krun_config *) cookie;
-  void *handle;
-  int32_t ctx_id, ret;
-  libcrun_error_t err;
-
-  ret = libkrun_configure_flavor (cookie, container, &err);
-  if (UNLIKELY (ret < 0))
-    {
-      int errcode = crun_error_get_errno (&err);
-      crun_error_release (&err);
-      error (EXIT_FAILURE, errcode, "unable to configure libkrun flavor");
-    }
+  void *handle = kconf->handle;
+  KrunError krun_err = NULL;
+  KrunMmioDeviceManager devices = NULL;
+  KrunPayload payload;
+  KrunVmmBuilder builder;
+  KrunVmm vmm;
 
   // /dev/kvm is required for all non AWS nitro workloads.
   if (! kconf->awsnitro && ! kconf->has_kvm)
     error (EXIT_FAILURE, 0, "`/dev/kvm` unavailable");
 
-  handle = kconf->handle;
-  ctx_id = kconf->ctx_id;
-
-  krun_set_log_level = dlsym (handle, "krun_set_log_level");
-  krun_start_enter = dlsym (handle, "krun_start_enter");
-  if (krun_set_log_level == NULL || krun_start_enter == NULL)
-    error (EXIT_FAILURE, 0, "could not find symbol in the krun library");
-
-  /* Set log level according to crun's verbosity. */
-  switch (libcrun_get_verbosity ())
-    {
-    case LIBCRUN_VERBOSITY_DEBUG:
-      krun_set_log_level (KRUN_LOG_LEVEL_DEBUG);
-      break;
-    case LIBCRUN_VERBOSITY_WARNING:
-      krun_set_log_level (KRUN_LOG_LEVEL_WARN);
-      break;
-    default:
-      krun_set_log_level (KRUN_LOG_LEVEL_ERROR);
-      break;
-    }
-
-  if (kconf->sev)
-    {
-      krun_set_root_disk = dlsym (handle, "krun_set_root_disk");
-      krun_set_tee_config_file = dlsym (handle, "krun_set_tee_config_file");
-      if (krun_set_root_disk == NULL || krun_set_tee_config_file == NULL)
-        error (EXIT_FAILURE, 0, "could not find symbol in `libkrun-sev.so`");
-
-      ret = krun_set_root_disk (ctx_id, "/disk.img");
-      if (UNLIKELY (ret < 0))
-        error (EXIT_FAILURE, -ret, "could not set root disk");
-
-      ret = krun_set_tee_config_file (ctx_id, KRUN_SEV_FILE);
-      if (UNLIKELY (ret < 0))
-        error (EXIT_FAILURE, -ret, "could not set krun tee config file");
-    }
-  else
-    {
-      json_object *val_virtiofs_tag = NULL;
-      json_object *val_virtiofs_shm_size = NULL;
-      const char *virtiofs_tag = NULL;
-      // Default to a conservative DAX size of 512MB, just like krun_set_root() does.
-      uint64_t virtiofs_shm_size = 512 * 1024 * 1024ULL;
-
-      if (kconf->config_tree != NULL)
-        {
-          val_virtiofs_tag = json_object_object_get (kconf->config_tree, "virtiofs_tag");
-          if (val_virtiofs_tag != NULL && json_object_is_type (val_virtiofs_tag, json_type_string))
-            virtiofs_tag = json_object_get_string (val_virtiofs_tag);
-
-          val_virtiofs_shm_size = json_object_object_get (kconf->config_tree, "virtiofs_shm_size");
-          if (val_virtiofs_shm_size != NULL && json_object_is_type (val_virtiofs_shm_size, json_type_int))
-            virtiofs_shm_size = json_object_get_uint64 (val_virtiofs_shm_size);
-        }
-
-      if (virtiofs_tag == NULL)
-        virtiofs_tag = "/dev/root";
-
-      krun_add_virtiofs2 = dlsym (handle, "krun_add_virtiofs2");
-
-      if (krun_add_virtiofs2 == NULL)
-        error (EXIT_FAILURE, 0, "could not find symbol `krun_add_virtiofs2` in `libkrun.so`");
-
-      ret = krun_add_virtiofs2 (ctx_id, virtiofs_tag, "/", virtiofs_shm_size);
-      if (UNLIKELY (ret < 0))
-        error (EXIT_FAILURE, -ret, "could not add virtiofs root with tag `%s`", virtiofs_tag);
-    }
+  libkrun_setup_logging (handle);
 
   if (kconf->awsnitro)
+    payload = libkrun_nitro_payload (kconf, container, pathname, argv);
+  else
     {
-      krun_set_console_output = dlsym (handle, "krun_set_console_output");
-      krun_set_exec = dlsym (handle, "krun_set_exec");
-      if (krun_set_console_output == NULL || krun_set_exec == NULL)
-        error (EXIT_FAILURE, 0, "could not find symbol in `libkrun-awsnitro.so`");
+      KrunFsOverlay overlay = NULL;
 
-      // Redirect all enclave output (read from vsock) to stdout.
-      ret = krun_set_console_output (ctx_id, "/dev/stdout");
-      if (UNLIKELY (ret < 0))
-        error (EXIT_FAILURE, -ret, "could not redirect enclave output to stdout");
+      payload = kconf->payload;
+      if (payload == NULL)
+        payload = libkrun_external_kernel_payload (kconf);
 
-      ret = krun_set_exec (ctx_id, pathname, (const char *const *) argv,
-                           (const char *const *) def->process->env);
-      if (UNLIKELY (ret < 0))
-        error (EXIT_FAILURE, -ret, "could not set enclave execution arguments");
-    }
+      if (! kconf->sev)
+        {
+          KrunInitBuilder init_builder = libkrun_init_builder (kconf);
+          overlay = libkrun_apply_init_config (kconf, payload, &init_builder);
+        }
 
-  ret = libkrun_configure_vm (ctx_id, handle, kconf, container, &err);
-  if (UNLIKELY (ret))
-    {
-      int errcode = crun_error_get_errno (&err);
-      libcrun_error_t *tmp_err = &err;
-      libcrun_error_report_and_release (tmp_err);
-      error (EXIT_FAILURE, errcode, "could not configure krun vm");
+      devices = KRUN_SYM (handle, krun_mmio_device_manager_new) ();
+      libkrun_add_console (handle, devices);
+      if (kconf->sev)
+        libkrun_add_root_disk (handle, devices);
+      else
+        libkrun_add_root_fs (kconf, devices, overlay);
+      libkrun_add_vsock (kconf, devices);
+      libkrun_add_net (kconf, container, devices);
+      if (kconf->gpu_flags > 0)
+        libkrun_add_gpu (kconf, devices);
+      libkrun_add_misc_devices (handle, devices);
     }
 
   json_object_put (kconf->config_doc);
+  kconf->config_doc = kconf->config_tree = NULL;
 
-  ret = krun_start_enter (ctx_id);
-  if (UNLIKELY (ret < 0))
-    error (EXIT_FAILURE, -ret, "could not start krun");
+  builder = KRUN_SYM (handle, krun_vmm_builder_new) ();
+  libkrun_configure_vm (kconf, container, &builder);
+  KRUN_SYM (handle, krun_vmm_builder_payload) (&builder, payload);
+  if (devices != NULL)
+    KRUN_SYM (handle, krun_vmm_builder_devices) (&builder, devices);
 
-  return ret;
-}
+  vmm = KRUN_SYM (handle, krun_vmm_builder_build) (&builder, &krun_err);
+  libkrun_die_on_error (handle, krun_err, "could not start krun");
 
-static int
-libkrun_start_render_server (struct krun_config *kconf, libcrun_container_t *container, libcrun_error_t *err)
-{
-  int ret;
-
-  kconf->gpu_flags = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.gpu_flags", "gpu_flags", false);
-  if (kconf->gpu_flags > 0)
-    {
-      if (access ("/dev/dri", F_OK) != 0)
-        return crun_make_error (err, errno, "gpu requested but /dev/dri is not available");
-
-      if ((kconf->gpu_flags & VIRGLRENDERER_RENDER_SERVER) != 0)
-        {
-          char *rs_argv[40];
-          int rs_argc = 0;
-          char fd_as_str[16];
-          int gpu_fds[2];
-          pid_t pid;
-          int null;
-
-          if (access ("/usr/libexec/virgl_render_server", X_OK) != 0)
-            return crun_make_error (err, errno, "gpu with render server requested but couldn't find /usr/libexec/virgl_render_server binary");
-
-          if (access ("/usr/bin/bwrap", X_OK) != 0)
-            return crun_make_error (err, errno, "gpu with render server requested but couldn't find /usr/bin/bwrap binary");
-
-          ret = socketpair (AF_UNIX, SOCK_SEQPACKET, 0, gpu_fds);
-          if (UNLIKELY (ret < 0))
-            return crun_make_error (err, errno, "could not create socketpair for virgl_render_server");
-
-          snprintf (fd_as_str, sizeof (fd_as_str), "%d", gpu_fds[FD_PAIR_CHILD]);
-
-          rs_argv[rs_argc++] = (char *) "bwrap";
-          rs_argv[rs_argc++] = (char *) "--ro-bind";
-          rs_argv[rs_argc++] = (char *) "/usr";
-          rs_argv[rs_argc++] = (char *) "/usr";
-          if (access ("/lib", F_OK) == 0)
-            {
-              rs_argv[rs_argc++] = (char *) "--ro-bind";
-              rs_argv[rs_argc++] = (char *) "/lib";
-              rs_argv[rs_argc++] = (char *) "/lib";
-            }
-          if (access ("/lib64", F_OK) == 0)
-            {
-              rs_argv[rs_argc++] = (char *) "--ro-bind";
-              rs_argv[rs_argc++] = (char *) "/lib64";
-              rs_argv[rs_argc++] = (char *) "/lib64";
-            }
-          rs_argv[rs_argc++] = (char *) "--ro-bind";
-          rs_argv[rs_argc++] = (char *) "/etc";
-          rs_argv[rs_argc++] = (char *) "/etc";
-          rs_argv[rs_argc++] = (char *) "--ro-bind";
-          rs_argv[rs_argc++] = (char *) "/sys";
-          rs_argv[rs_argc++] = (char *) "/sys";
-          rs_argv[rs_argc++] = (char *) "--dev";
-          rs_argv[rs_argc++] = (char *) "/dev";
-          rs_argv[rs_argc++] = (char *) "--dev-bind";
-          rs_argv[rs_argc++] = (char *) "/dev/dri";
-          rs_argv[rs_argc++] = (char *) "/dev/dri";
-          rs_argv[rs_argc++] = (char *) "--proc";
-          rs_argv[rs_argc++] = (char *) "/proc";
-          rs_argv[rs_argc++] = (char *) "--tmpfs";
-          rs_argv[rs_argc++] = (char *) "/tmp";
-          rs_argv[rs_argc++] = (char *) "--unshare-pid";
-          rs_argv[rs_argc++] = (char *) "--unshare-ipc";
-          rs_argv[rs_argc++] = (char *) "--unshare-net";
-          rs_argv[rs_argc++] = (char *) "--";
-          rs_argv[rs_argc++] = (char *) "/usr/libexec/virgl_render_server";
-          rs_argv[rs_argc++] = (char *) "--socket-fd";
-          rs_argv[rs_argc++] = fd_as_str;
-          rs_argv[rs_argc] = NULL;
-
-          pid = fork ();
-          if (pid < 0)
-            {
-              close (gpu_fds[FD_PAIR_PARENT]);
-              close (gpu_fds[FD_PAIR_CHILD]);
-              return crun_make_error (err, errno, "could not fork for virgl_render_server");
-            }
-          else if (pid == 0)
-            {
-              close (gpu_fds[FD_PAIR_PARENT]);
-
-              null = open ("/dev/null", O_WRONLY);
-              if (null == -1)
-                _exit (EXIT_FAILURE);
-
-              dup2 (null, STDOUT_FILENO);
-              dup2 (null, STDERR_FILENO);
-              close (null);
-
-              execvp ("/usr/bin/bwrap", rs_argv);
-              _exit (EXIT_FAILURE);
-            }
-
-          close (gpu_fds[FD_PAIR_CHILD]);
-          kconf->gpu_render_server_fd = gpu_fds[FD_PAIR_PARENT];
-        }
-    }
-
+  /* Never returns: the process becomes the VMM and exits with the workload status.  */
+  KRUN_SYM (handle, krun_vmm_run) (vmm);
   return 0;
 }
 
@@ -856,9 +1001,6 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
     {
       cleanup_free char *origin_config_path = NULL;
       cleanup_free char *state_dir = NULL;
-      cleanup_free char *config = NULL;
-      cleanup_close int fd = -1;
-      size_t config_size;
 
       ret = libcrun_get_state_directory (&state_dir, context->state_root, context->id, err);
       if (UNLIKELY (ret < 0))
@@ -868,17 +1010,9 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       if (UNLIKELY (ret < 0))
         return ret;
 
-      ret = read_all_file (origin_config_path, &config, &config_size, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
-      /* CVE-2025-24965: the content below rootfs cannot be trusted because it is controlled by the user.  We
-         must ensure the file is opened below the rootfs directory.  */
-      fd = safe_openat (rootfsfd, rootfs, KRUN_CONFIG_FILE, WRITE_FILE_DEFAULT_FLAGS | O_NOFOLLOW, S_IRUSR | S_IRGRP | S_IROTH, err);
-      if (UNLIKELY (fd < 0))
-        return fd;
-
-      ret = safe_write (fd, KRUN_CONFIG_FILE, config, config_size, err);
+      /* The OCI configuration is handed to libkrun_init, which injects the guest
+         init and its configuration into the root file system.  */
+      ret = read_all_file (origin_config_path, &kconf->oci_config_json, &kconf->oci_config_json_size, err);
       if (UNLIKELY (ret < 0))
         return ret;
 
@@ -886,7 +1020,15 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       if (UNLIKELY (ret < 0))
         return ret;
 
-      ret = libkrun_start_render_server (kconf, container, err);
+      ret = libkrun_configure_flavor (kconf, container, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      kconf->gpu_flags = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.gpu_flags", "gpu_flags", false);
+      if (kconf->gpu_flags > 0 && access ("/dev/dri", F_OK) != 0)
+        return crun_make_error (err, errno, "gpu requested but /dev/dri is not available");
+
+      ret = libkrun_load_payload (kconf, rootfsfd, rootfs, container, err);
       if (UNLIKELY (ret < 0))
         return ret;
     }
@@ -902,10 +1044,10 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
   if (spec_has_device (def, "/dev/kvm"))
     return 0;
 
-  if (kconf->handle_sev != NULL)
+  if (kconf->sev)
     create_sev = ! spec_has_device (def, "/dev/sev");
 
-  if (kconf->handle_awsnitro != NULL)
+  if (kconf->awsnitro)
     create_awsnitro = ! spec_has_device (def, "/dev/nitro_enclaves");
 
   devfd = safe_openat (rootfsfd, rootfs, "dev", O_PATH | O_DIRECTORY | O_CLOEXEC, 0, err);
@@ -928,24 +1070,14 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
     {
       ret = libcrun_create_dev (container, devfd, -1, &sev_device, is_user_ns, true, err);
       if (UNLIKELY (ret < 0))
-        {
-          ret = dlclose (kconf->handle_sev);
-          if (UNLIKELY (ret < 0))
-            return ret;
-          kconf->handle_sev = NULL;
-        }
+        return ret;
     }
 
   if (create_awsnitro)
     {
       ret = libcrun_create_dev (container, devfd, -1, &nitro_device, is_user_ns, true, err);
       if (UNLIKELY (ret < 0))
-        {
-          ret = dlclose (kconf->handle_awsnitro);
-          if (UNLIKELY (ret < 0))
-            return ret;
-          kconf->handle_awsnitro = NULL;
-        }
+        return ret;
     }
 
   return 0;
@@ -954,18 +1086,13 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
 static int
 libkrun_load (void **cookie, libcrun_error_t *err)
 {
-  int32_t ret;
   struct krun_config *kconf;
-  const char *libkrun_so = "libkrun.so.1";
-  const char *libkrun_sev_so = "libkrun-sev.so.1";
-  const char *libkrun_awsnitro_so = "libkrun-awsnitro.so.1";
+  const char *libkrun_so = "libkrun.so.2";
+  const char *libkrun_sev_so = "libkrun-sev.so.2";
+  const char *libkrun_awsnitro_so = "libkrun-awsnitro.so.2";
+  const char *libkrun_init_so = "libkrun_init.so.0";
 
-  kconf = malloc (sizeof (struct krun_config));
-  if (kconf == NULL)
-    return crun_make_error (err, 0, "could not allocate memory for krun_config");
-  memset (kconf, 0, sizeof (struct krun_config));
-
-  kconf->gpu_render_server_fd = -1;
+  kconf = xmalloc0 (sizeof (struct krun_config));
 
   kconf->handle = dlopen (libkrun_so, RTLD_NOW);
   kconf->handle_sev = dlopen (libkrun_sev_so, RTLD_NOW);
@@ -977,49 +1104,26 @@ libkrun_load (void **cookie, libcrun_error_t *err)
       return crun_make_error (err, 0, "failed to open `%s`, `%s`, and `%s` for krun_config: %s", libkrun_so, libkrun_sev_so, libkrun_awsnitro_so, dlerror ());
     }
 
-  kconf->sev = false;
-  kconf->awsnitro = false;
+  /* libkrun_init provides the guest init binary and its configuration.  It is
+     required for every flavor that boots from a shared root file system.  */
+  kconf->handle_init = dlopen (libkrun_init_so, RTLD_NOW);
+  if (kconf->handle_init == NULL)
+    {
+      int ret = crun_make_error (err, 0, "failed to open `%s`: %s", libkrun_init_so, dlerror ());
 
-  /* Newer versions of libkrun no longer link against libkrunfw and
-     instead they open it when creating the context. This implies
-     we need to call "krun_create_ctx" before switching namespaces
-     or it won't be able to find the library bundling the kernel. */
-  if (kconf->handle)
-    {
-      ret = libkrun_create_context (kconf->handle, err);
-      if (UNLIKELY (ret < 0))
-        goto error;
-      kconf->ctx_id = ret;
-    }
-
-  if (kconf->handle_sev)
-    {
-      ret = libkrun_create_context (kconf->handle_sev, err);
-      if (UNLIKELY (ret < 0))
-        goto error;
-      kconf->ctx_id_sev = ret;
-    }
-  if (kconf->handle_awsnitro)
-    {
-      ret = libkrun_create_context (kconf->handle_awsnitro, err);
-      if (UNLIKELY (ret < 0))
-        goto error;
-      kconf->ctx_id_awsnitro = ret;
+      if (kconf->handle)
+        dlclose (kconf->handle);
+      if (kconf->handle_sev)
+        dlclose (kconf->handle_sev);
+      if (kconf->handle_awsnitro)
+        dlclose (kconf->handle_awsnitro);
+      free (kconf);
+      return ret;
     }
 
   *cookie = kconf;
 
   return 0;
-
-error:
-  if (kconf->handle)
-    dlclose (kconf->handle);
-  if (kconf->handle_sev)
-    dlclose (kconf->handle_sev);
-  if (kconf->handle_awsnitro)
-    dlclose (kconf->handle_awsnitro);
-  free (kconf);
-  return ret;
 }
 
 static int
@@ -1030,6 +1134,12 @@ libkrun_unload (void *cookie, libcrun_error_t *err)
   struct krun_config *kconf = (struct krun_config *) cookie;
   if (kconf != NULL)
     {
+      if (kconf->payload != NULL)
+        {
+          krun_payload_destroy_fn payload_destroy = dlsym (kconf->handle, "krun_payload_destroy");
+          if (payload_destroy != NULL)
+            payload_destroy (kconf->payload);
+        }
       if (kconf->handle != NULL)
         {
           r = dlclose (kconf->handle);
@@ -1048,6 +1158,15 @@ libkrun_unload (void *cookie, libcrun_error_t *err)
           if (UNLIKELY (r != 0))
             return crun_make_error (err, 0, "could not unload handle_awsnitro: `%s`", dlerror ());
         }
+      if (kconf->handle_init != NULL)
+        {
+          r = dlclose (kconf->handle_init);
+          if (UNLIKELY (r != 0))
+            return crun_make_error (err, 0, "could not unload handle_init: `%s`", dlerror ());
+        }
+      if (kconf->config_doc != NULL)
+        json_object_put (kconf->config_doc);
+      free (kconf->oci_config_json);
       free (kconf);
     }
   return 0;
@@ -1155,38 +1274,19 @@ libkrun_close_fds (void *cookie, libcrun_container_t *container, int preserve_fd
 {
   struct krun_config *kconf = (struct krun_config *) cookie;
   int first_fd_to_close = preserve_fds + 3;
-  int low_fd, high_fd;
   int i;
 
-  low_fd = high_fd = -1;
-
-  if (kconf->use_passt)
-    high_fd = kconf->passt_fds[FD_PAIR_PARENT];
-
-  if (kconf->gpu_render_server_fd != -1)
+  if (kconf->use_passt && first_fd_to_close <= kconf->passt_fds[FD_PAIR_PARENT])
     {
-      if (kconf->gpu_render_server_fd > high_fd)
-        {
-          low_fd = high_fd;
-          high_fd = kconf->gpu_render_server_fd;
-        }
-      else
-        low_fd = kconf->gpu_render_server_fd;
-    }
-
-  if (first_fd_to_close <= high_fd)
-    {
-      for (i = first_fd_to_close; i < high_fd; i++)
+      for (i = first_fd_to_close; i < kconf->passt_fds[FD_PAIR_PARENT]; i++)
         {
           // If we're closing proc_fd, make sure to invalidate it.
           if (i == container->proc_fd)
             container->proc_fd = -1;
-          else if (i == low_fd)
-            continue;
           close (i);
         }
 
-      first_fd_to_close = high_fd + 1;
+      first_fd_to_close = kconf->passt_fds[FD_PAIR_PARENT] + 1;
     }
 
   return mark_or_close_fds_ge_than (container, first_fd_to_close, true, err);

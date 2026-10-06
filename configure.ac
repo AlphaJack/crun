@@ -189,7 +189,10 @@ AS_IF([test "x$with_wamr" = "xyes"], AC_CHECK_HEADERS([wasm_export.h], AC_DEFINE
 
 dnl include support for libkrun (EXPERIMENTAL)
 AC_ARG_WITH([libkrun], AS_HELP_STRING([--with-libkrun], [build with libkrun support]))
-AS_IF([test "x$with_libkrun" = "xyes"], AC_CHECK_HEADERS([libkrun.h], AC_DEFINE([HAVE_LIBKRUN], 1, [Define if libkrun is available]), [AC_MSG_ERROR([*** Missing libkrun headers])]))
+AS_IF([test "x$with_libkrun" = "xyes"], [
+  AC_CHECK_HEADERS([libkrun.h], AC_DEFINE([HAVE_LIBKRUN], 1, [Define if libkrun is available]), [AC_MSG_ERROR([*** Missing libkrun headers])])
+  AC_CHECK_HEADERS([libkrun_init.h libkrun_display.h], [], [AC_MSG_ERROR([*** Missing libkrun 2.0 headers (libkrun_init.h, libkrun_display.h)])])
+])
 
 AM_CONDITIONAL([ENABLE_KRUN], [test "x$with_libkrun" = xyes])
 
