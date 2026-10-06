@@ -20,6 +20,7 @@
 #define CUSTOM_HANDLER_H
 
 #include "container.h"
+#include "status.h"
 #include "utils.h"
 #include <stdio.h>
 
@@ -39,7 +40,22 @@ struct custom_handler_s
                    const char *pathname, char *const argv[]);
 
   int (*exec_func) (void *cookie, libcrun_container_t *container,
+                    runtime_spec_schema_config_schema_process *process,
                     const char *pathname, char *const argv[]);
+
+  /* Called in the exec process before it drops the container's root
+     privileges and before the seccomp profile is applied, so the handler
+     can open the resources exec_func needs.  */
+  int (*prepare_exec) (void *cookie, libcrun_container_t *container,
+                       runtime_spec_schema_config_schema_process *process,
+                       libcrun_error_t *err);
+
+  /* Deliver SIGNAL to the container workload.  Handlers that run the
+     workload outside of the container process tree use it to route the
+     signal; the default is to signal the container process.  */
+  int (*kill_func) (void *cookie, libcrun_container_t *container,
+                    libcrun_container_status_t *status, int signal,
+                    libcrun_error_t *err);
 
   int (*configure_container) (void *cookie, enum handler_configure_phase phase,
                               libcrun_context_t *context, libcrun_container_t *container,

@@ -1993,6 +1993,8 @@ libcrun_container_delete (libcrun_context_t *context, const char *id, bool force
 int
 libcrun_container_kill (libcrun_context_t *context, const char *id, const char *signal, libcrun_error_t *err)
 {
+  cleanup_custom_handler_instance struct custom_handler_instance_s *custom_handler = NULL;
+  cleanup_container libcrun_container_t *container = NULL;
   int sig, ret;
   const char *state_root = context->state_root;
   cleanup_container_status libcrun_container_status_t status = {};
@@ -2004,6 +2006,23 @@ libcrun_container_kill (libcrun_context_t *context, const char *id, const char *
   ret = libcrun_read_container_status (&status, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  ret = read_container_config_from_state (&container, state_root, id, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  container->context = context;
+
+  ret = libcrun_configure_handler (context->handler_manager,
+                                   context,
+                                   container,
+                                   &custom_handler,
+                                   err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (custom_handler && custom_handler->vtable->kill_func)
+    return custom_handler->vtable->kill_func (custom_handler->cookie, container, &status, sig, err);
 
   return libcrun_kill_linux (&status, sig, err);
 }
@@ -3926,6 +3945,13 @@ exec_process_entrypoint (libcrun_context_t *context,
         return ret;
     }
 
+  if (custom_handler && custom_handler->vtable->prepare_exec)
+    {
+      ret = custom_handler->vtable->prepare_exec (custom_handler->cookie, container, process, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
   ret = mark_or_close_fds_ge_than (container, context->preserve_fds + 3, false, err);
   if (UNLIKELY (ret < 0))
     return ret;
@@ -3999,6 +4025,7 @@ exec_process_entrypoint (libcrun_context_t *context,
 
       ret = custom_handler->vtable->exec_func (custom_handler->cookie,
                                                container,
+                                               process,
                                                exec_path,
                                                process->args);
       if (UNLIKELY (ret < 0))
