@@ -88,6 +88,17 @@ The following annotations are supported:
     **sev** (AMD SEV confidential workloads) and **aws-nitro** (AWS
     Nitro Enclaves).
 
+**krun.exec**=*NUM*
+:   When set to a value greater than 0, run an exec server inside the
+    microVM. It makes **krun exec** (and therefore **podman exec** and
+    health checks) start processes inside the VM, and routes the
+    signals sent with **krun kill** to the workload instead of the VMM,
+    so that **podman stop** can terminate it gracefully. The server
+    listens on a vsock port that only the host can reach, exposed as
+    **/dev/krun-init.sock** inside the container, so it also works
+    with a read-only container root. Not available with the **sev**
+    and **aws-nitro** variants.
+
 ## VM Configuration File
 
 A **.krun_vm.json** file can be placed at the root of the container
@@ -110,7 +121,7 @@ the following optional fields:
 
 The following options are only available through OCI annotations and
 are not read from the configuration file: **gpu_flags**,
-**use_passt**, **tap_name**, **nested_virt**, and **flavor**.
+**use_passt**, **tap_name**, **nested_virt**, **exec**, and **flavor**.
 
 Example:
 

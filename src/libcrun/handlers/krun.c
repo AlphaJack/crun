@@ -31,6 +31,7 @@
 #include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <ocispec/runtime_spec_schema_config_schema.h>
 
 #ifdef HAVE_DLOPEN
@@ -79,6 +80,15 @@
 #define FD_PAIR_PARENT 0
 #define FD_PAIR_CHILD 1
 
+/* The guest init control server (libkrun_init "control socket").  The VMM exposes
+ * it as a Unix socket in the container's /dev tmpfs, which exists for read-only
+ * containers too and goes away with the container.  `krun exec` reaches it from
+ * inside the container, `krun kill` through /proc/<vmm pid>/root.
+ */
+#define KRUN_CONTROL_SOCKET "/dev/krun-init.sock"
+#define KRUN_CONTROL_EXEC_TIMEOUT_MS 10000
+#define KRUN_CONTROL_KILL_TIMEOUT_MS 2000
+
 struct krun_config
 {
   void *handle;
@@ -98,6 +108,8 @@ struct krun_config
   char *oci_config_json;
   size_t oci_config_json_size;
   KrunPayload payload;
+  bool exec_enabled;
+  KrunInitController controller;
 };
 
 /* libkrun handler.  */
@@ -292,6 +304,12 @@ libkrun_parse_string_configuration (json_object *config_tree, libcrun_container_
 
   *value = json_object_get_string (val_json);
   return 0;
+}
+
+static bool
+libkrun_exec_enabled (libcrun_container_t *container)
+{
+  return libkrun_parse_resource_configuration (NULL, container, "krun.exec", "exec", false) > 0;
 }
 
 static const char *
@@ -561,17 +579,19 @@ libkrun_nitro_payload (struct krun_config *kconf, libcrun_container_t *container
 /* Inject the init binary and its configuration into the guest root.  Returns the
    overlay that must be attached to the root virtiofs device.  */
 static KrunFsOverlay
-libkrun_apply_init_config (struct krun_config *kconf, KrunPayload payload, KrunInitBuilder *builder)
+libkrun_apply_init_config (struct krun_config *kconf, KrunPayload payload, KrunInitBuilder *builder, KrunVsockDevice vsock)
 {
   void *handle_init = kconf->handle_init;
   krun_init_builder_build_fn build = KRUN_SYM (handle_init, krun_init_builder_build);
-  krun_init_config_apply_in_fn apply_in = KRUN_SYM (handle_init, krun_init_config_apply_in);
   KrunFsOverlay overlay = KRUN_SYM (kconf->handle, krun_fs_overlay_new) ();
   KrunInitError init_err = NULL;
   KrunInitConfig config;
 
   config = build (builder);
-  apply_in (config, kconf->handle, overlay, payload, &init_err);
+  if (kconf->exec_enabled)
+    KRUN_SYM (handle_init, krun_init_config_apply_with_vsock_in) (config, kconf->handle, overlay, payload, vsock, &init_err);
+  else
+    KRUN_SYM (handle_init, krun_init_config_apply_in) (config, kconf->handle, overlay, payload, &init_err);
   if (init_err != NULL)
     error (EXIT_FAILURE, 0, "could not apply the krun init configuration: %s", libkrun_init_error_string (handle_init, init_err));
 
@@ -593,6 +613,9 @@ libkrun_init_builder (struct krun_config *kconf)
 
   if (kconf->use_passt)
     KRUN_SYM (handle_init, krun_init_builder_dhcp) (&builder, true);
+
+  if (kconf->exec_enabled)
+    KRUN_SYM (handle_init, krun_init_builder_control_socket) (&builder, KRUN_STR (KRUN_CONTROL_SOCKET));
 
   return builder;
 }
@@ -655,8 +678,8 @@ libkrun_add_root_disk (void *handle, KrunMmioDeviceManager devices)
   KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, disk);
 }
 
-static void
-libkrun_add_vsock (struct krun_config *kconf, KrunMmioDeviceManager devices)
+static KrunVsockDevice
+libkrun_new_vsock (struct krun_config *kconf)
 {
   void *handle = kconf->handle;
   uint32_t tsi_flags = (kconf->tap_name != NULL || kconf->use_passt) ? 0 : KRUN_TSI_FLAGS_HIJACK_INET;
@@ -666,7 +689,12 @@ libkrun_add_vsock (struct krun_config *kconf, KrunMmioDeviceManager devices)
   vsock = KRUN_SYM (handle, krun_vsock_device_new) (LIBKRUN_GUEST_CID, tsi_flags, &krun_err);
   libkrun_die_on_error (handle, krun_err, "could not create the vsock device");
 
-  KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, vsock);
+  /* /dev is normally a fresh tmpfs, but with a bundle that lacks one a socket left
+     behind by a previous run would make bind() fail.  */
+  if (kconf->exec_enabled)
+    unlink (KRUN_CONTROL_SOCKET);
+
+  return vsock;
 }
 
 static void
@@ -824,15 +852,17 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   else
     {
       KrunFsOverlay overlay = NULL;
+      KrunVsockDevice vsock;
 
       payload = kconf->payload;
       if (payload == NULL)
         payload = libkrun_external_kernel_payload (kconf);
 
+      vsock = libkrun_new_vsock (kconf);
       if (! kconf->sev)
         {
           KrunInitBuilder init_builder = libkrun_init_builder (kconf);
-          overlay = libkrun_apply_init_config (kconf, payload, &init_builder);
+          overlay = libkrun_apply_init_config (kconf, payload, &init_builder, vsock);
         }
 
       devices = KRUN_SYM (handle, krun_mmio_device_manager_new) ();
@@ -841,7 +871,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
         libkrun_add_root_disk (handle, devices);
       else
         libkrun_add_root_fs (kconf, devices, overlay);
-      libkrun_add_vsock (kconf, devices);
+      KRUN_SYM (handle, krun_mmio_device_manager_add) (devices, vsock);
       libkrun_add_net (kconf, container, devices);
       if (kconf->gpu_flags > 0)
         libkrun_add_gpu (kconf, devices);
@@ -1028,6 +1058,10 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       if (kconf->gpu_flags > 0 && access ("/dev/dri", F_OK) != 0)
         return crun_make_error (err, errno, "gpu requested but /dev/dri is not available");
 
+      kconf->exec_enabled = libkrun_exec_enabled (container);
+      if (kconf->exec_enabled && (kconf->sev || kconf->awsnitro))
+        return crun_make_error (err, 0, "krun.exec is only supported with the default libkrun flavor");
+
       ret = libkrun_load_payload (kconf, rootfsfd, rootfs, container, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -1166,6 +1200,12 @@ libkrun_unload (void *cookie, libcrun_error_t *err)
         }
       if (kconf->config_doc != NULL)
         json_object_put (kconf->config_doc);
+      if (kconf->controller != NULL)
+        {
+          krun_init_controller_destroy_fn controller_destroy = dlsym (kconf->handle_init, "krun_init_controller_destroy");
+          if (controller_destroy != NULL)
+            controller_destroy (kconf->controller);
+        }
       free (kconf->oci_config_json);
       free (kconf);
     }
@@ -1292,6 +1332,199 @@ libkrun_close_fds (void *cookie, libcrun_container_t *container, int preserve_fd
   return mark_or_close_fds_ge_than (container, first_fd_to_close, true, err);
 }
 
+static int krun_exec_signal_fd = -1;
+
+static void
+krun_exec_signal_handler (int sig)
+{
+  unsigned char b = sig;
+  int saved_errno = errno;
+
+  if (krun_exec_signal_fd >= 0)
+    TEMP_FAILURE_RETRY (write (krun_exec_signal_fd, &b, 1));
+  errno = saved_errno;
+}
+
+/* Signals delivered to the exec helper are forwarded to the guest process; SIGWINCH
+   becomes a resize of the guest terminal.  Returns the read end of the signal pipe.  */
+static int
+krun_exec_signal_pipe (void)
+{
+  static const int forwarded_signals[] = { SIGWINCH, SIGINT, SIGTERM, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2 };
+  struct sigaction sa;
+  int sigpipe[2];
+  size_t i;
+
+  if (pipe2 (sigpipe, O_CLOEXEC | O_NONBLOCK) < 0)
+    error (EXIT_FAILURE, errno, "pipe");
+  krun_exec_signal_fd = sigpipe[1];
+
+  memset (&sa, 0, sizeof (sa));
+  sa.sa_handler = krun_exec_signal_handler;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset (&sa.sa_mask);
+  for (i = 0; i < sizeof (forwarded_signals) / sizeof (forwarded_signals[0]); i++)
+    sigaction (forwarded_signals[i], &sa, NULL);
+
+  return sigpipe[0];
+}
+
+static int
+libkrun_prepare_exec (void *cookie, libcrun_container_t *container, runtime_spec_schema_config_schema_process *process arg_unused, libcrun_error_t *err)
+{
+  struct krun_config *kconf = (struct krun_config *) cookie;
+  krun_init_controller_open_fn controller_open;
+  KrunInitError init_err = NULL;
+
+  if (! libkrun_exec_enabled (container))
+    return crun_make_error (err, 0, "exec requires the container to be created with the `krun.exec=1` annotation");
+
+  controller_open = libkrun_dlsym (kconf->handle_init, "krun_init_controller_open", err);
+  if (controller_open == NULL)
+    return -1;
+
+  kconf->controller = controller_open (KRUN_STR (KRUN_CONTROL_SOCKET), KRUN_CONTROL_EXEC_TIMEOUT_MS, &init_err);
+  if (init_err != NULL)
+    {
+      cleanup_free char *msg = libkrun_init_error_string (kconf->handle_init, init_err);
+      return crun_make_error (err, 0, "could not reach the krun init control socket: %s", msg);
+    }
+
+  return 0;
+}
+
+static KrunInitExecRequest
+libkrun_exec_request (void *handle_init, runtime_spec_schema_config_schema_process *process, const char *pathname, char *const argv[])
+{
+  KrunInitExecRequest request = KRUN_SYM (handle_init, krun_init_exec_request_new) (KRUN_STR (pathname));
+  krun_init_exec_request_arg_fn add_arg = KRUN_SYM (handle_init, krun_init_exec_request_arg);
+  krun_init_exec_request_env_var_fn add_env = KRUN_SYM (handle_init, krun_init_exec_request_env_var);
+  size_t i;
+
+  for (i = 0; argv[i]; i++)
+    add_arg (&request, KRUN_STR (argv[i]));
+  for (i = 0; environ && environ[i]; i++)
+    add_env (&request, KRUN_STR (environ[i]));
+  if (! is_empty_string (process->cwd))
+    KRUN_SYM (handle_init, krun_init_exec_request_cwd) (&request, KRUN_STR (process->cwd));
+
+  if (process->user)
+    {
+      krun_init_exec_request_additional_gid_fn add_gid = KRUN_SYM (handle_init, krun_init_exec_request_additional_gid);
+
+      KRUN_SYM (handle_init, krun_init_exec_request_uid) (&request, process->user->uid);
+      KRUN_SYM (handle_init, krun_init_exec_request_gid) (&request, process->user->gid);
+      for (i = 0; i < process->user->additional_gids_len; i++)
+        add_gid (&request, process->user->additional_gids[i]);
+      if (process->user->umask_present)
+        KRUN_SYM (handle_init, krun_init_exec_request_umask) (&request, process->user->umask);
+    }
+
+  return request;
+}
+
+static int
+libkrun_exec_process (void *cookie, libcrun_container_t *container arg_unused, runtime_spec_schema_config_schema_process *process, const char *pathname, char *const argv[])
+{
+  struct krun_config *kconf = (struct krun_config *) cookie;
+  void *handle_init = kconf->handle_init;
+  KrunInitExecRequest request;
+  KrunInitProcess guest_process;
+  KrunInitError init_err = NULL;
+  int32_t exit_code = EXIT_FAILURE;
+
+  if (kconf->controller == NULL)
+    error (EXIT_FAILURE, 0, "krun exec: not connected to the init control socket");
+
+  request = libkrun_exec_request (handle_init, process, pathname, argv);
+  if (process->terminal)
+    guest_process = KRUN_SYM (handle_init, krun_init_controller_exec_tty) (kconf->controller, request, STDIN_FILENO, &init_err);
+  else
+    guest_process = KRUN_SYM (handle_init, krun_init_controller_exec_pipes) (kconf->controller, request, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &init_err);
+  KRUN_SYM (handle_init, krun_init_exec_request_destroy) (request);
+  if (init_err != NULL)
+    {
+      /* Same exit codes as a failed execve in a regular container.  */
+      bool not_found = KRUN_SYM (handle_init, krun_init_error_result) (init_err) == KRUN_INIT_ERROR_CONTROL_EXECUTABLE_NOT_FOUND;
+
+      error (not_found ? 127 : 126, 0, "krun exec: %s", libkrun_init_error_string (handle_init, init_err));
+    }
+
+  KRUN_SYM (handle_init, krun_init_process_wait) (guest_process, krun_exec_signal_pipe (), &exit_code, &init_err);
+  if (init_err != NULL)
+    error (EXIT_FAILURE, 0, "krun exec: %s", libkrun_init_error_string (handle_init, init_err));
+
+  _exit (exit_code);
+}
+
+/* Deliver SIGNAL to the workload inside the VM.  Signalling the VMM process would
+   only kill the VM, so route the signal through the init control socket.  SIGKILL
+   still goes to the VMM, as does everything when the control socket is not
+   available.  */
+static int
+libkrun_kill (void *cookie, libcrun_container_t *container, libcrun_container_status_t *status, int signal, libcrun_error_t *err)
+{
+  struct krun_config *kconf = (struct krun_config *) cookie;
+  void *handle_init = kconf->handle_init;
+  krun_init_controller_open_fn controller_open;
+  krun_init_controller_signal_entrypoint_fn signal_entrypoint;
+  krun_init_controller_destroy_fn controller_destroy;
+  cleanup_free char *path = NULL;
+  KrunInitController controller;
+  KrunInitError init_err = NULL;
+  int ret;
+
+  libcrun_debug ("krun: kill signal %d, control socket %s", signal,
+                 libkrun_exec_enabled (container) ? "enabled" : "disabled");
+
+  if (signal == SIGKILL || ! libkrun_exec_enabled (container))
+    return libcrun_kill_linux (status, signal, err);
+
+  controller_open = libkrun_dlsym (handle_init, "krun_init_controller_open", err);
+  if (controller_open == NULL)
+    return -1;
+  signal_entrypoint = libkrun_dlsym (handle_init, "krun_init_controller_signal_entrypoint", err);
+  if (signal_entrypoint == NULL)
+    return -1;
+  controller_destroy = libkrun_dlsym (handle_init, "krun_init_controller_destroy", err);
+  if (controller_destroy == NULL)
+    return -1;
+
+  /* The pid must still be our VMM before its /proc entry can be trusted.  */
+  ret = libcrun_check_pid_valid (status, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+  if (ret == 0)
+    {
+      errno = ESRCH;
+      return crun_make_error (err, errno, "kill container");
+    }
+
+  /* The socket lives in the container's /dev tmpfs, visible from the host only
+     through the VMM's root.  The path also stays below the Unix socket limit.  */
+  xasprintf (&path, "/proc/%d/root%s", status->pid, KRUN_CONTROL_SOCKET);
+
+  controller = controller_open (KRUN_STR (path), KRUN_CONTROL_KILL_TIMEOUT_MS, &init_err);
+  if (init_err != NULL)
+    {
+      cleanup_free char *msg = libkrun_init_error_string (handle_init, init_err);
+
+      /* The guest is not up yet, so nothing in there can handle the signal anyway.  */
+      libcrun_debug ("krun: control socket unavailable (%s), signalling the VMM", msg);
+      return libcrun_kill_linux (status, signal, err);
+    }
+
+  signal_entrypoint (controller, signal, &init_err);
+  controller_destroy (controller);
+  if (init_err != NULL)
+    {
+      cleanup_free char *msg = libkrun_init_error_string (handle_init, init_err);
+      return crun_make_error (err, 0, "krun init control: %s", msg);
+    }
+
+  return 0;
+}
+
 struct custom_handler_s handler_libkrun = {
   .name = "krun",
   .alias = NULL,
@@ -1300,6 +1533,9 @@ struct custom_handler_s handler_libkrun = {
   .load = libkrun_load,
   .unload = libkrun_unload,
   .run_func = libkrun_exec,
+  .prepare_exec = libkrun_prepare_exec,
+  .exec_func = libkrun_exec_process,
+  .kill_func = libkrun_kill,
   .configure_container = libkrun_configure_container,
   .modify_oci_configuration = libkrun_modify_oci_configuration,
   .close_fds = libkrun_close_fds,
